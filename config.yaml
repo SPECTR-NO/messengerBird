@@ -1,0 +1,14 @@
+listen: 0.0.0.0:8787
+radio:
+  channel: 1
+  squelch: 1
+  ctcss: 0
+  uart_port: /dev/ttyAMA0
+  ch_bit1_gpio: 5
+  ch_bit2_gpio: 6
+  ch_bit4_gpio: 12
+  ch_bit8_gpio: 13
+  ptt_gpio: 23
+  spken_gpio: 24
+  audio_device: plughw:CARD=Headphones,DEV=0
+  muted: false

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=MessengerBird
+Comment=SA828 radio sender
+Exec=/home/makwan/Desktop/messengerBird/start.sh
+Path=/home/makwan/Desktop/messengerBird
+Icon=radio
+Terminal=false
+Categories=Utility;
