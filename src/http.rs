@@ -1,32 +1,53 @@
-//! Tiny VisionLab listener — POST /tx with JSON `{"message":"…"}`.
+//! One HTTP listener per sender config.
+//! Each machine POSTs its own port: POST /tx plays that sender's fixed message.
 
+use crate::config::SenderCfg;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-pub fn spawn(addr: &str) -> Result<(), String> {
-    let listener = TcpListener::bind(addr).map_err(|e| format!("bind {addr}: {e}"))?;
+pub fn spawn_all(senders: &[SenderCfg]) -> Result<(), String> {
+    if senders.is_empty() {
+        return Err("no senders configured".into());
+    }
+    for sender in senders {
+        spawn_one(sender.clone())?;
+    }
+    Ok(())
+}
+
+fn spawn_one(sender: SenderCfg) -> Result<(), String> {
+    let addr = sender.listen.clone();
+    let listener = TcpListener::bind(&addr).map_err(|e| format!("bind {addr}: {e}"))?;
     listener
         .set_nonblocking(false)
         .map_err(|e| e.to_string())?;
-    eprintln!("MessengerBird listening on http://{addr}");
+    eprintln!(
+        "MessengerBird [{}] listening on http://{}/tx  →  “{}”",
+        sender.id,
+        addr,
+        sender.phrase()
+    );
+    let sender = Arc::new(sender);
     thread::spawn(move || {
         for stream in listener.incoming() {
             match stream {
                 Ok(stream) => {
                     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
                     let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
-                    thread::spawn(move || handle(stream));
+                    let sender = Arc::clone(&sender);
+                    thread::spawn(move || handle(stream, &sender));
                 }
-                Err(e) => eprintln!("http accept: {e}"),
+                Err(e) => eprintln!("http accept [{}]: {e}", sender.id),
             }
         }
     });
     Ok(())
 }
 
-fn handle(mut stream: TcpStream) {
+fn handle(mut stream: TcpStream, sender: &SenderCfg) {
     let mut buf = vec![0u8; 16_384];
     let n = match stream.read(&mut buf) {
         Ok(0) | Err(_) => return,
@@ -34,16 +55,30 @@ fn handle(mut stream: TcpStream) {
     };
     let raw = String::from_utf8_lossy(&buf[..n]);
     let (method, path) = parse_request_line(&raw);
-    let body = body_of(&raw);
 
     let (code, payload) = match (method.as_str(), path.as_str()) {
         ("GET", "/") | ("GET", "/index.html") => (
             200,
-            r#"{"ok":true,"app":"MessengerBird","hint":"desktop UI is the app; POST /tx to transmit"}"#.into(),
+            serde_json::json!({
+                "ok": true,
+                "app": "MessengerBird",
+                "id": sender.id,
+                "name": sender.display_name(),
+                "message": sender.phrase(),
+                "hint": "POST /tx to transmit this sender's fixed announcement",
+            })
+            .to_string(),
         ),
-        ("GET", "/health") => (200, r#"{"ok":true}"#.into()),
-        ("GET", "/api/status") => (200, status_json()),
-        ("POST", "/tx") | ("POST", "/api/tx") | ("POST", "/webhook") => tx_response(&body),
+        ("GET", "/health") => (
+            200,
+            serde_json::json!({
+                "ok": true,
+                "id": sender.id,
+            })
+            .to_string(),
+        ),
+        ("GET", "/api/status") => (200, status_json(sender)),
+        ("POST", "/tx") | ("POST", "/api/tx") | ("POST", "/webhook") => tx_response(sender),
         _ => (404, r#"{"ok":false,"message":"not found"}"#.into()),
     };
 
@@ -78,17 +113,7 @@ fn parse_request_line(raw: &str) -> (String, String) {
     (method, path)
 }
 
-fn body_of(raw: &str) -> String {
-    if let Some(idx) = raw.find("\r\n\r\n") {
-        return raw[idx + 4..].to_string();
-    }
-    if let Some(idx) = raw.find("\n\n") {
-        return raw[idx + 2..].to_string();
-    }
-    String::new()
-}
-
-fn status_json() -> String {
+fn status_json(sender: &SenderCfg) -> String {
     let lamp = match crate::radio::line_lamp() {
         crate::radio::LineLamp::Tx => "tx",
         crate::radio::LineLamp::Busy => "busy",
@@ -96,21 +121,38 @@ fn status_json() -> String {
     };
     serde_json::json!({
         "ok": true,
+        "id": sender.id,
+        "name": sender.display_name(),
+        "message": sender.phrase(),
+        "listen": sender.listen,
+        "sender_muted": sender.muted,
         "busy": crate::radio::busy(),
-        "muted": crate::radio::muted(),
+        "muted": crate::radio::muted() || sender.muted,
         "lamp": lamp,
         "last_message": crate::radio::last_message(),
     })
     .to_string()
 }
 
-fn tx_response(body: &str) -> (u16, String) {
-    let message = extract_message(body).unwrap_or_else(|| "Alert".into());
+fn tx_response(sender: &SenderCfg) -> (u16, String) {
+    if sender.muted {
+        return (
+            503,
+            serde_json::json!({
+                "ok": false,
+                "id": sender.id,
+                "message": format!("Sender “{}” is muted", sender.display_name()),
+            })
+            .to_string(),
+        );
+    }
+    let message = sender.phrase().to_string();
     match crate::radio::transmit_message(&message) {
         Ok(()) => (
             200,
             serde_json::json!({
                 "ok": true,
+                "id": sender.id,
                 "message": format!("Transmitting “{message}”"),
             })
             .to_string(),
@@ -119,22 +161,10 @@ fn tx_response(body: &str) -> (u16, String) {
             503,
             serde_json::json!({
                 "ok": false,
+                "id": sender.id,
                 "message": e,
             })
             .to_string(),
         ),
     }
-}
-
-fn extract_message(body: &str) -> Option<String> {
-    let v: serde_json::Value = serde_json::from_str(body).ok()?;
-    for key in ["message", "phrase", "name"] {
-        if let Some(s) = v.get(key).and_then(|x| x.as_str()) {
-            let t = s.trim();
-            if !t.is_empty() {
-                return Some(t.to_string());
-            }
-        }
-    }
-    None
 }

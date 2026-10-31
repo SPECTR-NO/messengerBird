@@ -1,4 +1,5 @@
 //! MessengerBird — straight SA828 radio sender (SiloMonitor radio path, no vision).
+//! Multiple independent sender endpoints share one radio channel.
 
 mod config;
 mod http;
@@ -18,19 +19,21 @@ const GREEN: Color32 = Color32::from_rgb(48, 209, 88);
 const RED: Color32 = Color32::from_rgb(255, 69, 58);
 const AMBER: Color32 = Color32::from_rgb(255, 159, 10);
 const BTN: Color32 = Color32::from_rgb(44, 44, 46);
+const BLUE: Color32 = Color32::from_rgb(10, 132, 255);
 
 fn main() -> eframe::Result<()> {
     let cfg = Config::load();
     apply_radio_runtime(&cfg);
 
-    if let Err(e) = http::spawn(&cfg.listen) {
+    if let Err(e) = http::spawn_all(&cfg.senders) {
         eprintln!("http: {e}");
     }
 
+    let height = 360.0 + (cfg.senders.len() as f32) * 110.0;
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([420.0, 520.0])
-            .with_min_inner_size([360.0, 420.0])
+            .with_inner_size([440.0, height.clamp(520.0, 900.0)])
+            .with_min_inner_size([380.0, 480.0])
             .with_title("MessengerBird"),
         ..Default::default()
     };
@@ -60,7 +63,6 @@ struct App {
     cfg: Config,
     note: String,
     note_ok: bool,
-    test_message: String,
 }
 
 impl App {
@@ -69,7 +71,6 @@ impl App {
             cfg,
             note: String::new(),
             note_ok: true,
-            test_message: "Alert".into(),
         }
     }
 
@@ -121,9 +122,17 @@ impl App {
         }
     }
 
-    fn transmit(&mut self) {
-        match radio::transmit_message(&self.test_message) {
-            Ok(()) => self.set_note("Transmitting…", true),
+    fn transmit_sender(&mut self, idx: usize) {
+        let Some(sender) = self.cfg.senders.get(idx) else {
+            return;
+        };
+        if sender.muted {
+            self.set_note(format!("{} is muted", sender.display_name()), false);
+            return;
+        }
+        let phrase = sender.phrase().to_string();
+        match radio::transmit_message(&phrase) {
+            Ok(()) => self.set_note(format!("Transmitting “{phrase}”…"), true),
             Err(e) => self.set_note(e, false),
         }
     }
@@ -144,99 +153,134 @@ impl eframe::App for App {
         ctx.set_visuals(visuals);
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.add_space(16.0);
-            ui.label(RichText::new("MessengerBird").size(26.0).strong().color(TEXT));
-            ui.label(
-                RichText::new("Straight radio sender · SA828 UHF")
-                    .size(13.0)
-                    .color(MUTED),
-            );
-            ui.add_space(18.0);
-
-            card(ui, |ui| {
-                let (label, color) = match radio::line_lamp() {
-                    LineLamp::Tx => ("Transmitting", RED),
-                    LineLamp::Busy => ("Channel busy", AMBER),
-                    LineLamp::Off if self.cfg.radio.muted => ("Muted", MUTED),
-                    LineLamp::Off => ("Idle", GREEN),
-                };
-                ui.label(RichText::new(label).size(28.0).strong().color(color));
-                ui.add_space(8.0);
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                ui.add_space(16.0);
+                ui.label(RichText::new("MessengerBird").size(26.0).strong().color(TEXT));
                 ui.label(
-                    RichText::new(peltor::channel_label(self.cfg.radio.channel))
-                        .size(14.0)
-                        .color(TEXT),
-                );
-                if let Some(last) = radio::last_message() {
-                    ui.label(RichText::new(format!("Last · {last}")).size(13.0).color(MUTED));
-                } else {
-                    ui.label(RichText::new("Last · none").size(13.0).color(MUTED));
-                }
-                ui.label(
-                    RichText::new(format!("VisionLab → http://{}/tx", self.cfg.listen))
-                        .size(12.0)
+                    RichText::new("Independent senders · one SA828 channel")
+                        .size(13.0)
                         .color(MUTED),
                 );
-            });
+                ui.add_space(18.0);
 
-            ui.add_space(12.0);
-
-            card(ui, |ui| {
-                ui.label(RichText::new("Channel").size(12.0).color(MUTED));
-                egui::ComboBox::from_id_salt("channel")
-                    .selected_text(format!("Ch {}", self.cfg.radio.channel))
-                    .width(120.0)
-                    .show_ui(ui, |ui| {
-                        for ch in 1u8..=16 {
-                            ui.selectable_value(
-                                &mut self.cfg.radio.channel,
-                                ch,
-                                peltor::channel_label(ch),
-                            );
-                        }
-                    });
-
-                ui.add_space(10.0);
-                ui.label(RichText::new("Test message").size(12.0).color(MUTED));
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.test_message)
-                        .desired_width(280.0)
-                        .text_color(TEXT),
-                );
-
-                ui.add_space(10.0);
-                let mut muted = self.cfg.radio.muted;
-                if ui.checkbox(&mut muted, "Mute").changed() {
-                    self.cfg.radio.muted = muted;
-                    radio::set_muted(muted);
-                }
-
-                ui.add_space(14.0);
-                ui.horizontal(|ui| {
-                    if ghost_btn(ui, "Save").clicked() {
-                        self.save_and_apply();
+                card(ui, |ui| {
+                    let (label, color) = match radio::line_lamp() {
+                        LineLamp::Tx => ("Transmitting", RED),
+                        LineLamp::Busy => ("Channel busy", AMBER),
+                        LineLamp::Off if self.cfg.radio.muted => ("Muted", MUTED),
+                        LineLamp::Off => ("Idle", GREEN),
+                    };
+                    ui.label(RichText::new(label).size(28.0).strong().color(color));
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new(peltor::channel_label(self.cfg.radio.channel))
+                            .size(14.0)
+                            .color(TEXT),
+                    );
+                    if let Some(last) = radio::last_message() {
+                        ui.label(
+                            RichText::new(format!("Last · {last}"))
+                                .size(13.0)
+                                .color(MUTED),
+                        );
+                    } else {
+                        ui.label(RichText::new("Last · none").size(13.0).color(MUTED));
                     }
-                    if ghost_btn(ui, "Program").clicked() {
-                        self.program_module();
-                    }
-                    if ghost_btn(ui, "Read").clicked() {
-                        self.read_module();
-                    }
-                    let tx_enabled = !self.cfg.radio.muted && !radio::busy();
-                    ui.add_enabled_ui(tx_enabled, |ui| {
-                        if primary_btn(ui, "Transmit").clicked() {
-                            self.transmit();
-                        }
-                    });
                 });
 
-                if !self.note.is_empty() {
+                ui.add_space(12.0);
+
+                card(ui, |ui| {
+                    ui.label(RichText::new("Shared radio channel").size(12.0).color(MUTED));
+                    egui::ComboBox::from_id_salt("channel")
+                        .selected_text(format!("Ch {}", self.cfg.radio.channel))
+                        .width(120.0)
+                        .show_ui(ui, |ui| {
+                            for ch in 1u8..=16 {
+                                ui.selectable_value(
+                                    &mut self.cfg.radio.channel,
+                                    ch,
+                                    peltor::channel_label(ch),
+                                );
+                            }
+                        });
+
                     ui.add_space(10.0);
-                    ui.label(
-                        RichText::new(&self.note)
-                            .size(12.0)
-                            .color(if self.note_ok { GREEN } else { RED }),
-                    );
+                    let mut muted = self.cfg.radio.muted;
+                    if ui.checkbox(&mut muted, "Mute all radio").changed() {
+                        self.cfg.radio.muted = muted;
+                        radio::set_muted(muted);
+                    }
+
+                    ui.add_space(14.0);
+                    ui.horizontal(|ui| {
+                        if ghost_btn(ui, "Save").clicked() {
+                            self.save_and_apply();
+                        }
+                        if ghost_btn(ui, "Program").clicked() {
+                            self.program_module();
+                        }
+                        if ghost_btn(ui, "Read").clicked() {
+                            self.read_module();
+                        }
+                    });
+
+                    if !self.note.is_empty() {
+                        ui.add_space(10.0);
+                        ui.label(
+                            RichText::new(&self.note)
+                                .size(12.0)
+                                .color(if self.note_ok { GREEN } else { RED }),
+                        );
+                    }
+                });
+
+                ui.add_space(12.0);
+                ui.label(RichText::new("Senders").size(12.0).color(MUTED));
+                ui.add_space(6.0);
+
+                let count = self.cfg.senders.len();
+                for idx in 0..count {
+                    let (name, listen, phrase, sender_muted) = {
+                        let s = &self.cfg.senders[idx];
+                        (
+                            s.display_name().to_string(),
+                            s.listen.clone(),
+                            s.phrase().to_string(),
+                            s.muted,
+                        )
+                    };
+
+                    card(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(&name).size(16.0).strong().color(TEXT));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                let mut muted = sender_muted;
+                                if ui.checkbox(&mut muted, "Mute").changed() {
+                                    self.cfg.senders[idx].muted = muted;
+                                }
+                            });
+                        });
+                        ui.label(
+                            RichText::new(format!("WAV · {phrase}"))
+                                .size(12.0)
+                                .color(MUTED),
+                        );
+                        ui.label(
+                            RichText::new(format!("POST http://{listen}/tx"))
+                                .size(12.0)
+                                .color(MUTED),
+                        );
+                        ui.add_space(8.0);
+                        let tx_enabled =
+                            !self.cfg.radio.muted && !sender_muted && !radio::busy();
+                        ui.add_enabled_ui(tx_enabled, |ui| {
+                            if primary_btn(ui, "Transmit").clicked() {
+                                self.transmit_sender(idx);
+                            }
+                        });
+                    });
+                    ui.add_space(8.0);
                 }
             });
         });
@@ -263,7 +307,7 @@ fn ghost_btn(ui: &mut egui::Ui, label: &str) -> egui::Response {
 fn primary_btn(ui: &mut egui::Ui, label: &str) -> egui::Response {
     ui.add(
         egui::Button::new(RichText::new(label).strong().color(Color32::WHITE))
-            .fill(Color32::from_rgb(10, 132, 255))
+            .fill(BLUE)
             .corner_radius(8.0)
             .min_size(egui::vec2(100.0, 34.0)),
     )

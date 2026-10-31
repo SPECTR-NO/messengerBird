@@ -6,14 +6,29 @@ use std::path::{Path, PathBuf};
 pub struct Config {
     #[serde(default)]
     pub radio: RadioCfg,
-    #[serde(default = "default_listen")]
-    pub listen: String,
+    /// One independent HTTP endpoint per announcing machine.
+    #[serde(default = "default_senders")]
+    pub senders: Vec<SenderCfg>,
+    /// Legacy single listen address (migrated into `senders` on load).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listen: Option<String>,
     #[serde(skip)]
     pub source_path: Option<PathBuf>,
 }
 
-fn default_listen() -> String {
-    "0.0.0.0:8787".into()
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SenderCfg {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub listen: String,
+    /// Fixed phrase / WAV slug this endpoint always transmits.
+    #[serde(default)]
+    pub message: String,
+    #[serde(default)]
+    pub muted: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -45,7 +60,7 @@ pub struct RadioCfg {
 }
 
 fn default_channel() -> u8 {
-    1
+    3
 }
 fn default_squelch() -> u8 {
     1
@@ -75,6 +90,32 @@ fn default_audio() -> String {
     "plughw:CARD=Headphones,DEV=0".into()
 }
 
+fn default_senders() -> Vec<SenderCfg> {
+    vec![
+        SenderCfg {
+            id: "silo_empty".into(),
+            name: "Silo is empty".into(),
+            listen: "0.0.0.0:8787".into(),
+            message: "Silo is empty".into(),
+            muted: false,
+        },
+        SenderCfg {
+            id: "check_camera".into(),
+            name: "Check camera".into(),
+            listen: "0.0.0.0:8788".into(),
+            message: "Check camera".into(),
+            muted: false,
+        },
+        SenderCfg {
+            id: "starlinger_red".into(),
+            name: "Starlinger red".into(),
+            listen: "0.0.0.0:8789".into(),
+            message: "Starlinger red".into(),
+            muted: false,
+        },
+    ]
+}
+
 impl Default for RadioCfg {
     fn default() -> Self {
         Self {
@@ -98,8 +139,29 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             radio: RadioCfg::default(),
-            listen: default_listen(),
+            senders: default_senders(),
+            listen: None,
             source_path: None,
+        }
+    }
+}
+
+impl SenderCfg {
+    pub fn display_name(&self) -> &str {
+        if !self.name.trim().is_empty() {
+            self.name.trim()
+        } else if !self.message.trim().is_empty() {
+            self.message.trim()
+        } else {
+            self.id.as_str()
+        }
+    }
+
+    pub fn phrase(&self) -> &str {
+        if !self.message.trim().is_empty() {
+            self.message.trim()
+        } else {
+            self.display_name()
         }
     }
 }
@@ -118,7 +180,6 @@ impl Config {
                 if p.exists() {
                     return p;
                 }
-                // cargo run: target/release → repo root
                 if let Some(root) = exe.ancestors().nth(3) {
                     let p = root.join("config.yaml");
                     if p.exists() {
@@ -144,21 +205,55 @@ impl Config {
         } else {
             Self::default()
         };
-        cfg.radio.channel = crate::peltor::clamp_channel(cfg.radio.channel);
-        cfg.radio.ctcss = crate::peltor::clamp_ctcss(cfg.radio.ctcss);
-        cfg.radio.squelch = crate::sa828::clamp_squelch(cfg.radio.squelch);
-        if cfg.listen.trim().is_empty() {
-            cfg.listen = default_listen();
-        }
+        cfg.normalize();
         cfg.source_path = Some(path.to_path_buf());
         cfg
     }
 
+    fn normalize(&mut self) {
+        self.radio.channel = crate::peltor::clamp_channel(self.radio.channel);
+        self.radio.ctcss = crate::peltor::clamp_ctcss(self.radio.ctcss);
+        self.radio.squelch = crate::sa828::clamp_squelch(self.radio.squelch);
+
+        if self.senders.is_empty() {
+            if let Some(listen) = self.listen.clone().filter(|s| !s.trim().is_empty()) {
+                self.senders = vec![SenderCfg {
+                    id: "default".into(),
+                    name: "Alert".into(),
+                    listen,
+                    message: "Alert".into(),
+                    muted: false,
+                }];
+            } else {
+                self.senders = default_senders();
+            }
+        }
+
+        for (i, sender) in self.senders.iter_mut().enumerate() {
+            if sender.id.trim().is_empty() {
+                sender.id = format!("sender_{}", i + 1);
+            }
+            if sender.listen.trim().is_empty() {
+                sender.listen = format!("0.0.0.0:{}", 8787 + i as u16);
+            }
+            if sender.message.trim().is_empty() {
+                sender.message = if sender.name.trim().is_empty() {
+                    sender.id.clone()
+                } else {
+                    sender.name.clone()
+                };
+            }
+            if sender.name.trim().is_empty() {
+                sender.name = sender.message.clone();
+            }
+        }
+
+        // Drop legacy key so saves stay on the multi-sender shape.
+        self.listen = None;
+    }
+
     pub fn save(&self) -> Result<(), String> {
-        let path = self
-            .source_path
-            .clone()
-            .unwrap_or_else(Self::path);
+        let path = self.source_path.clone().unwrap_or_else(Self::path);
         if let Some(parent) = path.parent() {
             let _ = fs::create_dir_all(parent);
         }

@@ -1,6 +1,6 @@
-listen: 0.0.0.0:8787
+# Shared SA828 radio — one channel for every sender.
 radio:
-  channel: 1
+  channel: 3
   squelch: 1
   ctcss: 0
   uart_port: /dev/ttyAMA0
@@ -12,3 +12,19 @@ radio:
   spken_gpio: 24
   audio_device: plughw:CARD=Headphones,DEV=0
   muted: false
+
+# Each sender is its own endpoint for a different machine.
+# That machine POSTs http://<pi-ip>:<port>/tx — no message body required.
+senders:
+  - id: silo_empty
+    name: Silo is empty
+    listen: 0.0.0.0:8787
+    message: Silo is empty
+  - id: check_camera
+    name: Check camera
+    listen: 0.0.0.0:8788
+    message: Check camera
+  - id: starlinger_red
+    name: Starlinger red
+    listen: 0.0.0.0:8789
+    message: Starlinger red
