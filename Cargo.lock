@@ -1736,6 +1736,7 @@ name = "messenger-bird"
 version = "0.1.0"
 dependencies = [
  "eframe",
+ "image",
  "rppal",
  "serde",
  "serde_json",

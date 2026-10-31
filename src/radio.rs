@@ -8,12 +8,13 @@
 //!   Audio: aplay → ALSA → pot → SA828 MIC+
 
 use rppal::gpio::{Gpio, OutputPin};
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Mutex;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_AUDIO: &str = "plughw:CARD=Headphones,DEV=0";
 const TX_MAX: Duration = Duration::from_secs(20);
@@ -32,6 +33,53 @@ static MUTED: AtomicBool = AtomicBool::new(false);
 static AUDIO_DEVICE: Mutex<String> = Mutex::new(String::new());
 static STATUS: Mutex<Option<String>> = Mutex::new(None);
 static LAST_MESSAGE: Mutex<Option<String>> = Mutex::new(None);
+static HISTORY: Mutex<VecDeque<AlertEvent>> = Mutex::new(VecDeque::new());
+const HISTORY_MAX: usize = 80;
+
+#[derive(Clone, Debug)]
+pub struct AlertEvent {
+    /// Unix seconds (local display formatted in UI).
+    pub at: u64,
+    pub message: String,
+    pub ok: bool,
+    pub detail: String,
+}
+
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+pub fn push_alert(message: impl Into<String>, ok: bool, detail: impl Into<String>) {
+    let event = AlertEvent {
+        at: now_unix(),
+        message: message.into(),
+        ok,
+        detail: detail.into(),
+    };
+    if let Ok(mut hist) = HISTORY.lock() {
+        hist.push_front(event);
+        while hist.len() > HISTORY_MAX {
+            hist.pop_back();
+        }
+    }
+}
+
+pub fn history() -> Vec<AlertEvent> {
+    HISTORY
+        .lock()
+        .ok()
+        .map(|h| h.iter().cloned().collect())
+        .unwrap_or_default()
+}
+
+pub fn clear_history() {
+    if let Ok(mut hist) = HISTORY.lock() {
+        hist.clear();
+    }
+}
 
 pub fn set_ptt_pin(pin: u8) {
     PTT_PIN.store(pin, Ordering::SeqCst);
@@ -346,36 +394,48 @@ pub fn resolve_wav(message: &str) -> Option<PathBuf> {
 
 /// Fire TX on a worker thread. Returns false if already transmitting or muted.
 pub fn transmit_message(message: &str) -> Result<(), String> {
-    if MUTED.load(Ordering::SeqCst) {
-        return Err("Muted".into());
-    }
-    let wav = resolve_wav(message).ok_or_else(|| {
-        format!(
-            "No WAV for “{message}”. Put {}.wav or alert.wav in audio/",
-            phrase_slug(message)
-        )
-    })?;
     let label = message.trim().to_string();
     if label.is_empty() {
-        return Err("Empty message".into());
+        let err = "Empty message".to_string();
+        push_alert("Alert", false, &err);
+        return Err(err);
     }
+    if MUTED.load(Ordering::SeqCst) {
+        let err = "Muted".to_string();
+        push_alert(&label, false, &err);
+        return Err(err);
+    }
+    let wav = match resolve_wav(&label) {
+        Some(path) => path,
+        None => {
+            let err = format!(
+                "No WAV for “{label}”. Put {}.wav or alert.wav in audio/",
+                phrase_slug(&label)
+            );
+            push_alert(&label, false, &err);
+            return Err(err);
+        }
+    };
     if TX_BUSY
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_err()
     {
-        return Err("Already transmitting".into());
+        let err = "Already transmitting".to_string();
+        push_alert(&label, false, &err);
+        return Err(err);
     }
     if let Ok(mut g) = LAST_MESSAGE.lock() {
         *g = Some(label.clone());
     }
     thread::spawn(move || {
-        let msg = match play_voice_keyed(&wav) {
-            Ok(()) => format!("Played {label}"),
+        let (ok, msg) = match play_voice_keyed(&wav) {
+            Ok(()) => (true, format!("Played {label}")),
             Err(e) => {
                 eprintln!("radio: {e}");
-                e
+                (false, e)
             }
         };
+        push_alert(&label, ok, &msg);
         set_status(msg);
         TX_BUSY.store(false, Ordering::SeqCst);
     });
