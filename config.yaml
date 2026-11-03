@@ -13,8 +13,14 @@ radio:
   audio_device: plughw:CARD=Headphones,DEV=0
   muted: false
 
-# Each sender is its own endpoint for a different machine.
-# That machine POSTs http://<pi-ip>:<port>/tx — no message body required.
+# Optional. Empty = off (VisionLab works with no header).
+# When set, POST /tx needs X-MessengerBird-Token or Authorization: Bearer …
+auth_token: ""
+
+# Each sender is its own endpoint for a different machine / VisionLab sound.
+# Bind is always 0.0.0.0 so Tailscale / LAN / WAN reach the Pi.
+# VisionLab host field = Tailscale IP / MagicDNS / public IP (no port).
+# POST http://<host>:<port>/tx — no message body required.
 senders:
   - id: silo_empty
     name: Silo is empty

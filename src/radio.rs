@@ -392,17 +392,50 @@ pub fn resolve_wav(message: &str) -> Option<PathBuf> {
     None
 }
 
-/// Fire TX on a worker thread. Returns false if already transmitting or muted.
+/// Optional cloud / audit metadata for a transmit.
+#[derive(Clone, Debug, Default)]
+pub struct TxMeta {
+    pub sender_id: String,
+    pub source: &'static str,
+    pub client_host: Option<String>,
+}
+
+/// Fire TX on a worker thread. Returns Ok when playback starts (or Err if rejected).
 pub fn transmit_message(message: &str) -> Result<(), String> {
+    transmit_with(message, TxMeta::default())
+}
+
+pub fn transmit_with(message: &str, meta: TxMeta) -> Result<(), String> {
     let label = message.trim().to_string();
+    let source = if meta.source.is_empty() {
+        "ui"
+    } else {
+        meta.source
+    };
     if label.is_empty() {
         let err = "Empty message".to_string();
         push_alert("Alert", false, &err);
+        crate::cloud::log_tx_simple(
+            &meta.sender_id,
+            "Alert",
+            false,
+            source,
+            meta.client_host.clone(),
+            Some(err.clone()),
+        );
         return Err(err);
     }
     if MUTED.load(Ordering::SeqCst) {
         let err = "Muted".to_string();
         push_alert(&label, false, &err);
+        crate::cloud::log_tx_simple(
+            &meta.sender_id,
+            &label,
+            false,
+            source,
+            meta.client_host.clone(),
+            Some(err.clone()),
+        );
         return Err(err);
     }
     let wav = match resolve_wav(&label) {
@@ -413,6 +446,14 @@ pub fn transmit_message(message: &str) -> Result<(), String> {
                 phrase_slug(&label)
             );
             push_alert(&label, false, &err);
+            crate::cloud::log_tx_simple(
+                &meta.sender_id,
+                &label,
+                false,
+                source,
+                meta.client_host.clone(),
+                Some(err.clone()),
+            );
             return Err(err);
         }
     };
@@ -422,11 +463,21 @@ pub fn transmit_message(message: &str) -> Result<(), String> {
     {
         let err = "Already transmitting".to_string();
         push_alert(&label, false, &err);
+        crate::cloud::log_tx_simple(
+            &meta.sender_id,
+            &label,
+            false,
+            source,
+            meta.client_host.clone(),
+            Some(err.clone()),
+        );
         return Err(err);
     }
     if let Ok(mut g) = LAST_MESSAGE.lock() {
         *g = Some(label.clone());
     }
+    let sender_id = meta.sender_id;
+    let client_host = meta.client_host;
     thread::spawn(move || {
         let (ok, msg) = match play_voice_keyed(&wav) {
             Ok(()) => (true, format!("Played {label}")),
@@ -436,6 +487,14 @@ pub fn transmit_message(message: &str) -> Result<(), String> {
             }
         };
         push_alert(&label, ok, &msg);
+        crate::cloud::log_tx_simple(
+            &sender_id,
+            &label,
+            ok,
+            source,
+            client_host,
+            Some(msg.clone()),
+        );
         set_status(msg);
         TX_BUSY.store(false, Ordering::SeqCst);
     });

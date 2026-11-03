@@ -1,0 +1,11 @@
+# Copy to config/supabase.yaml (gitignored) and fill in real values.
+# MessengerBird cloud only — never VisionLab’s project.
+
+url: https://YOUR_PROJECT.supabase.co
+publishable_key: sb_publishable_YOUR_KEY
+
+# Optional display name for the device singleton row.
+display_name: MessengerBird
+
+# Heartbeat / sync interval in seconds (device last_seen_at + sender upsert).
+sync_interval_secs: 60

@@ -4,3 +4,10 @@
 .venv/
 .venv-tts/
 audio/preview/
+
+# MessengerBird Supabase secrets + session (never commit real keys)
+config/supabase.yaml
+config/supabase.session.yaml
+.env
+.env.local
+

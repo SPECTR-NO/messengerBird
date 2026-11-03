@@ -1,3 +1,4 @@
+use crate::netinfo::{force_public_bind, listen_port};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -9,6 +10,10 @@ pub struct Config {
     /// One independent HTTP endpoint per announcing machine.
     #[serde(default = "default_senders")]
     pub senders: Vec<SenderCfg>,
+    /// Optional shared token for POST /tx. Empty = off (VisionLab works unchanged).
+    /// Clients may send `X-MessengerBird-Token` or `Authorization: Bearer …`.
+    #[serde(default)]
+    pub auth_token: String,
     /// Legacy single listen address (migrated into `senders` on load).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub listen: Option<String>,
@@ -140,6 +145,7 @@ impl Default for Config {
         Self {
             radio: RadioCfg::default(),
             senders: default_senders(),
+            auth_token: String::new(),
             listen: None,
             source_path: None,
         }
@@ -163,6 +169,15 @@ impl SenderCfg {
         } else {
             self.display_name()
         }
+    }
+
+    pub fn port(&self) -> u16 {
+        listen_port(&self.listen)
+    }
+
+    /// URL VisionLab hits for this sound (`host` = Tailscale/LAN/public, no port).
+    pub fn remote_tx_url(&self, host: &str) -> String {
+        format!("http://{}:{}/tx", host.trim(), self.port())
     }
 }
 
@@ -236,6 +251,8 @@ impl Config {
             if sender.listen.trim().is_empty() {
                 sender.listen = format!("0.0.0.0:{}", 8787 + i as u16);
             }
+            // Always bind all interfaces so Tailscale / WAN / another PC can reach us.
+            sender.listen = force_public_bind(&sender.listen);
             if sender.message.trim().is_empty() {
                 sender.message = if sender.name.trim().is_empty() {
                     sender.id.clone()
@@ -247,6 +264,8 @@ impl Config {
                 sender.name = sender.message.clone();
             }
         }
+
+        self.auth_token = self.auth_token.trim().to_string();
 
         // Drop legacy key so saves stay on the multi-sender shape.
         self.listen = None;
