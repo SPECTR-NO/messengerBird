@@ -37,7 +37,7 @@ struct SessionFile {
     expires_at: i64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct CloudStatus {
     pub configured: bool,
     pub signed_in: bool,
@@ -45,19 +45,6 @@ pub struct CloudStatus {
     pub last_sync: Option<u64>,
     pub last_error: Option<String>,
     pub syncing: bool,
-}
-
-impl Default for CloudStatus {
-    fn default() -> Self {
-        Self {
-            configured: false,
-            signed_in: false,
-            email: String::new(),
-            last_sync: None,
-            last_error: None,
-            syncing: false,
-        }
-    }
 }
 
 struct State {
@@ -219,6 +206,26 @@ pub fn sign_up(email: &str, password: &str) -> Result<(), String> {
 }
 
 pub fn sign_out() {
+    if let Some((url, key, token)) = state().lock().ok().and_then(|g| {
+        let cfg = g.cfg.as_ref()?;
+        if g.session.access_token.is_empty() {
+            None
+        } else {
+            Some((
+                cfg.url.clone(),
+                cfg.publishable_key.clone(),
+                g.session.access_token.clone(),
+            ))
+        }
+    }) {
+        let _ = http_json(
+            "POST",
+            &format!("{url}/auth/v1/logout?scope=global"),
+            &key,
+            Some(&token),
+            None,
+        );
+    }
     if let Ok(mut g) = state().lock() {
         g.session = SessionFile::default();
         g.status.signed_in = false;
@@ -226,6 +233,23 @@ pub fn sign_out() {
         g.status.last_error = None;
     }
     let _ = fs::remove_file(session_path());
+}
+
+pub fn request_password_reset(email: &str) -> Result<(), String> {
+    let email = email.trim();
+    if email.is_empty() {
+        return Err("Enter the account email first.".into());
+    }
+    let (url, key) = with_cfg(|c| (c.url.clone(), c.publishable_key.clone()))?;
+    let body = serde_json::json!({ "email": email });
+    http_json(
+        "POST",
+        &format!("{url}/auth/v1/recover"),
+        &key,
+        None,
+        Some(&body),
+    )?;
+    Ok(())
 }
 
 fn apply_token_response(resp: &serde_json::Value, email_fallback: &str) -> Result<(), String> {
@@ -390,7 +414,7 @@ fn rest_upsert(
 ) -> Result<(), String> {
     let (url, key, token) = ensure_access_token()?;
     let endpoint = format!("{url}/rest/v1/{table}?on_conflict={on_conflict}");
-    let mut req = ureq::request("POST", &endpoint)
+    let req = ureq::request("POST", &endpoint)
         .set("apikey", &key)
         .set("Authorization", &format!("Bearer {token}"))
         .set("Content-Type", "application/json")
@@ -439,8 +463,17 @@ pub fn sync_now(app: &Config) {
     let auth_on = !app.auth_token.trim().is_empty();
     let now_iso = chrono_like_now();
 
+    let device_key = app.device_id.clone();
+    let owner = jwt_sub(
+        &state()
+            .lock()
+            .ok()
+            .map(|g| g.session.access_token.clone())
+            .unwrap_or_default(),
+    );
     let device = serde_json::json!([{
-        "id": 1,
+        "device_key": device_key.clone(),
+        "owner_id": owner,
         "display_name": display_name,
         "lan_ip": lan,
         "tailscale_ip": ts,
@@ -453,15 +486,16 @@ pub fn sync_now(app: &Config) {
     let senders: Vec<serde_json::Value> = app
         .senders
         .iter()
-        .map(|s| sender_row(s, &now_iso))
+        .map(|s| sender_row(s, &now_iso, &device_key))
         .collect();
     let senders_json = serde_json::Value::Array(senders);
 
     match (|| -> Result<(), String> {
-        rest_upsert("device", &device, "id")?;
+        rest_upsert("device", &device, "device_key")?;
         if !senders_json.as_array().map(|a| a.is_empty()).unwrap_or(true) {
-            rest_upsert("senders", &senders_json, "id")?;
+            rest_upsert("senders", &senders_json, "device_key,id")?;
         }
+        flush_outbox()?;
         Ok(())
     })() {
         Ok(()) => set_sync_ok(),
@@ -469,8 +503,9 @@ pub fn sync_now(app: &Config) {
     }
 }
 
-fn sender_row(s: &SenderCfg, now_iso: &str) -> serde_json::Value {
+fn sender_row(s: &SenderCfg, now_iso: &str, device_key: &str) -> serde_json::Value {
     serde_json::json!({
+        "device_key": device_key,
         "id": s.id,
         "name": s.display_name(),
         "port": s.port(),
@@ -479,6 +514,81 @@ fn sender_row(s: &SenderCfg, now_iso: &str) -> serde_json::Value {
         "muted": s.muted,
         "updated_at": now_iso,
     })
+}
+
+fn outbox_path() -> PathBuf {
+    locate_beside_app("config/tx_outbox.jsonl")
+}
+
+fn enqueue_outbox(row: &serde_json::Value) {
+    let path = outbox_path();
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let mut line = row.to_string();
+    line.push('\n');
+    use std::io::Write;
+    if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
+fn flush_outbox() -> Result<(), String> {
+    let path = outbox_path();
+    let text = match fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(_) => return Ok(()),
+    };
+    let mut kept = Vec::new();
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let row: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if rest_insert("tx_events", &row).is_err() {
+            kept.push(line.to_string());
+        }
+    }
+    if kept.is_empty() {
+        let _ = fs::remove_file(path);
+    } else {
+        let _ = fs::write(path, kept.join("\n") + "\n");
+    }
+    Ok(())
+}
+
+fn jwt_sub(token: &str) -> Option<String> {
+    let payload = token.split('.').nth(1)?;
+    let bytes = b64url_decode(payload)?;
+    let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    v.get("sub").and_then(|s| s.as_str()).map(|s| s.to_string())
+}
+
+fn b64url_decode(input: &str) -> Option<Vec<u8>> {
+    let mut s = input.replace('-', "+").replace('_', "/");
+    while !s.len().is_multiple_of(4) {
+        s.push('=');
+    }
+    const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = Vec::new();
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i + 4 <= bytes.len() {
+        let n = |c: u8| T.iter().position(|x| *x == c).unwrap_or(0) as u32;
+        let chunk = (n(bytes[i]) << 18) | (n(bytes[i + 1]) << 12) | (n(bytes[i + 2]) << 6) | n(bytes[i + 3]);
+        out.push((chunk >> 16) as u8);
+        if bytes[i + 2] != b'=' {
+            out.push((chunk >> 8) as u8);
+        }
+        if bytes[i + 3] != b'=' {
+            out.push(chunk as u8);
+        }
+        i += 4;
+    }
+    Some(out)
 }
 
 fn chrono_like_now() -> String {
@@ -556,7 +666,9 @@ pub fn log_tx(event: TxEvent) {
         return;
     }
     thread::spawn(move || {
+        let device_key = crate::config::Config::load().device_id;
         let row = serde_json::json!({
+            "device_key": device_key,
             "sender_id": if event.sender_id.is_empty() { serde_json::Value::Null } else { serde_json::json!(event.sender_id) },
             "phrase": event.phrase,
             "ok": event.ok,
@@ -566,6 +678,7 @@ pub fn log_tx(event: TxEvent) {
             "fired_at": chrono_like_now(),
         });
         if let Err(e) = rest_insert("tx_events", &row) {
+            enqueue_outbox(&row);
             set_error(e);
         }
     });

@@ -10,10 +10,27 @@ pub struct Config {
     /// One independent HTTP endpoint per announcing machine.
     #[serde(default = "default_senders")]
     pub senders: Vec<SenderCfg>,
-    /// Optional shared token for POST /tx. Empty = off (VisionLab works unchanged).
-    /// Clients may send `X-MessengerBird-Token` or `Authorization: Bearer …`.
+    /// Shared token for POST /tx. Clients send `X-MessengerBird-Token` or `Authorization: Bearer …`.
     #[serde(default)]
     pub auth_token: String,
+    /// When false, POST /tx is open and an empty token is not auto-filled.
+    #[serde(default = "default_true")]
+    pub auth_enabled: bool,
+    /// Stable cloud device id (UUID). Empty until first save.
+    #[serde(default)]
+    pub device_id: String,
+    /// Max POST /tx per client IP per minute. 0 = unlimited.
+    #[serde(default = "default_rate")]
+    pub rate_per_minute: u32,
+    /// Optional CIDR allowlist for POST /tx. Empty = any source.
+    #[serde(default)]
+    pub allow_cidrs: Vec<String>,
+    #[serde(default)]
+    pub wizard_done: bool,
+    #[serde(skip)]
+    pub token_just_minted: bool,
+    #[serde(skip)]
+    pub needs_save: bool,
     /// Legacy single listen address (migrated into `senders` on load).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub listen: Option<String>,
@@ -62,6 +79,15 @@ pub struct RadioCfg {
     pub audio_device: String,
     #[serde(default)]
     pub muted: bool,
+    /// Seconds to wait for SPKEN low before the force-TX decision.
+    #[serde(default = "default_wait")]
+    pub channel_wait_secs: u64,
+    /// When true (SiloMonitor default), transmit after the wait even if still busy.
+    #[serde(default = "default_true")]
+    pub force_tx_if_busy: bool,
+    /// Skip GPIO and aplay (desktop development without a Pi).
+    #[serde(default)]
+    pub dry_run: bool,
 }
 
 fn default_channel() -> u8 {
@@ -93,6 +119,15 @@ fn default_spken() -> u8 {
 }
 fn default_audio() -> String {
     "plughw:CARD=Headphones,DEV=0".into()
+}
+fn default_true() -> bool {
+    true
+}
+fn default_wait() -> u64 {
+    30
+}
+fn default_rate() -> u32 {
+    30
 }
 
 fn default_senders() -> Vec<SenderCfg> {
@@ -136,6 +171,9 @@ impl Default for RadioCfg {
             spken_gpio: default_spken(),
             audio_device: default_audio(),
             muted: false,
+            channel_wait_secs: default_wait(),
+            force_tx_if_busy: true,
+            dry_run: false,
         }
     }
 }
@@ -146,6 +184,13 @@ impl Default for Config {
             radio: RadioCfg::default(),
             senders: default_senders(),
             auth_token: String::new(),
+            auth_enabled: true,
+            device_id: String::new(),
+            rate_per_minute: default_rate(),
+            allow_cidrs: Vec::new(),
+            wizard_done: false,
+            token_just_minted: false,
+            needs_save: false,
             listen: None,
             source_path: None,
         }
@@ -266,9 +311,28 @@ impl Config {
         }
 
         self.auth_token = self.auth_token.trim().to_string();
+        if self.radio.channel_wait_secs == 0 {
+            self.radio.channel_wait_secs = default_wait();
+        }
+        if self.device_id.trim().is_empty() {
+            self.device_id = new_uuid();
+            self.needs_save = true;
+        }
+        if self.auth_enabled && self.auth_token.is_empty() {
+            self.auth_token = random_token();
+            self.token_just_minted = true;
+            self.needs_save = true;
+        }
 
         // Drop legacy key so saves stay on the multi-sender shape.
         self.listen = None;
+    }
+
+    /// Persist a freshly minted token / device id after load.
+    pub fn ensure_persisted_secrets(&mut self) {
+        if self.needs_save {
+            let _ = self.save();
+        }
     }
 
     pub fn save(&self) -> Result<(), String> {
@@ -279,4 +343,39 @@ impl Config {
         let text = serde_yaml::to_string(self).map_err(|e| e.to_string())?;
         fs::write(&path, text).map_err(|e| e.to_string())
     }
+}
+
+fn random_bytes(n: usize) -> Vec<u8> {
+    use std::io::Read;
+    let mut buf = vec![0u8; n];
+    if let Ok(mut f) = fs::File::open("/dev/urandom") {
+        let _ = f.read_exact(&mut buf);
+    } else {
+        let t = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(1);
+        for (i, b) in buf.iter_mut().enumerate() {
+            *b = ((t >> ((i % 8) * 8)) as u8).wrapping_add(i as u8);
+        }
+    }
+    buf
+}
+
+pub fn random_token() -> String {
+    random_bytes(32)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+fn new_uuid() -> String {
+    let mut b = random_bytes(16);
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13],
+        b[14], b[15]
+    )
 }

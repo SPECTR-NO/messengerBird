@@ -86,6 +86,7 @@ pub fn sa828_freq_for_channel(ch: u8) -> String {
 }
 
 /// Nearest Peltor channel for a stored MHz string.
+#[allow(dead_code)]
 pub fn channel_for_freq(mhz: &str) -> u8 {
     let t = mhz.trim().replace(',', ".");
     let Ok(f) = t.parse::<f64>() else {

@@ -2,9 +2,9 @@
 Type=Application
 Name=MessengerBird
 Comment=Plant radio sender · SA828
-Exec=/home/makwan/Desktop/messengerBird/start.sh
-Path=/home/makwan/Desktop/messengerBird
-Icon=/home/makwan/Desktop/messengerBird/assets/icon.png
+Exec=messenger-bird
+Path=/opt/messengerbird
+Icon=/opt/messengerbird/assets/icon.png
 Terminal=false
-Categories=Utility;HamRadio;
+Categories=Utility;
 StartupWMClass=messenger-bird

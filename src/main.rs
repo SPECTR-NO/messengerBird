@@ -31,14 +31,17 @@ const HISTORY_H: f32 = 320.0;
 const ICON_PNG: &[u8] = include_bytes!("../assets/icon.png");
 
 fn main() -> eframe::Result<()> {
-    let cfg = Config::load();
+    let mut cfg = Config::load();
+    cfg.ensure_persisted_secrets();
     apply_radio_runtime(&cfg);
+    radio::load_history();
     cloud::init();
     cloud::spawn_startup_sync(cfg.clone());
 
     if let Err(e) = http::spawn_all(&cfg.senders, &cfg.auth_token) {
         eprintln!("http: {e}");
     }
+    http::publish_runtime(&cfg.senders, cfg.rate_per_minute, &cfg.allow_cidrs);
 
     let icon = load_window_icon();
     let mut viewport = egui::ViewportBuilder::default()
@@ -95,7 +98,11 @@ fn apply_radio_runtime(cfg: &Config) {
     );
     radio::set_audio_device(&cfg.radio.audio_device);
     radio::set_muted(cfg.radio.muted);
+    radio::set_dry_run(cfg.radio.dry_run);
+    radio::set_csma(cfg.radio.channel_wait_secs, cfg.radio.force_tx_if_busy);
     let _ = radio::select_channel(cfg.radio.channel);
+    http::set_auth_token(&cfg.auth_token);
+    http::publish_runtime(&cfg.senders, cfg.rate_per_minute, &cfg.allow_cidrs);
 }
 
 struct App {
@@ -111,12 +118,22 @@ struct App {
     cloud_note: String,
     cloud_note_ok: bool,
     show_cloud_sign_in: bool,
+    show_token: bool,
+    show_about: bool,
+    show_wizard: bool,
+    reveal_token: bool,
+    new_sender_name: String,
+    allow_cidr_edit: String,
+    host_ticks: u32,
 }
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>, cfg: Config) -> Self {
         configure_style(&cc.egui_ctx);
         let st = cloud::status();
+        let allow = cfg.allow_cidrs.join(", ");
+        let minted = cfg.token_just_minted;
+        let wizard = !cfg.wizard_done;
         Self {
             cfg,
             note: String::new(),
@@ -130,6 +147,13 @@ impl App {
             cloud_note: String::new(),
             cloud_note_ok: true,
             show_cloud_sign_in: st.configured && !st.signed_in,
+            show_token: minted,
+            show_about: false,
+            show_wizard: wizard,
+            reveal_token: minted,
+            new_sender_name: String::new(),
+            allow_cidr_edit: allow,
+            host_ticks: 0,
         }
     }
 
@@ -196,8 +220,16 @@ impl App {
             client_host: None,
         };
         match radio::transmit_with(&phrase, meta) {
-            Ok(()) => self.set_note(format!("Transmitting “{phrase}”…"), true),
+            Ok(radio::TxAccept::Started) => self.set_note(format!("Transmitting “{phrase}”…"), true),
+            Ok(radio::TxAccept::Queued) => self.set_note(format!("Queued “{phrase}”"), true),
             Err(e) => self.set_note(e, false),
+        }
+    }
+
+    fn persist(&mut self) {
+        apply_radio_runtime(&self.cfg);
+        if let Err(e) = self.cfg.save() {
+            self.set_note(format!("Save failed: {e}"), false);
         }
     }
 
@@ -227,7 +259,11 @@ impl App {
                 cloud::spawn_startup_sync(self.cfg.clone());
             }
             Err(e) => {
-                self.cloud_note = e;
+                self.cloud_note = if e.to_ascii_lowercase().contains("confirm") {
+                    format!("{e} Open the email, confirm, then sign in here.")
+                } else {
+                    e
+                };
                 self.cloud_note_ok = false;
             }
         }
@@ -268,6 +304,11 @@ impl eframe::App for App {
             self.set_note(status, ok);
         }
         cloud::tick_heartbeat(&self.cfg);
+        self.host_ticks = self.host_ticks.wrapping_add(1);
+        if self.host_ticks.is_multiple_of(75) {
+            self.remote_host = netinfo::visionlab_host();
+            self.host_source = netinfo::host_source_label();
+        }
         // Keep text marking on every frame (some egui paths reset interaction flags).
         ctx.style_mut(|style| {
             style.interaction.selectable_labels = true;
@@ -309,6 +350,7 @@ impl eframe::App for App {
                                     ui.add_space(4.0);
                                     self.senders(ui);
                                     ui.add_space(8.0);
+                                    self.auth_banner(ui);
                                 });
 
                                 ui.add_space(12.0);
@@ -321,11 +363,17 @@ impl eframe::App for App {
                         });
                     });
             });
+        if self.show_about {
+            self.about_window(ctx);
+        }
+        if self.show_wizard {
+            self.wizard_window(ctx);
+        }
     }
 }
 
 impl App {
-    fn header_bar(&self, ui: &mut egui::Ui) {
+    fn header_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.add(
                 egui::Image::new((self.logo.id(), Vec2::splat(28.0)))
@@ -339,6 +387,11 @@ impl App {
                     .color(TEXT),
             );
             ui.label(RichText::new("· plant radio").size(12.0).color(MUTED));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if link_btn(ui, "About").clicked() {
+                    self.show_about = true;
+                }
+            });
         });
     }
 
@@ -384,12 +437,11 @@ impl App {
                             self.show_cloud_sign_in = true;
                             self.cloud_note.clear();
                         }
-                    } else if st.configured {
-                        if link_btn(ui, if self.show_cloud_sign_in { "Hide" } else { "Sign in" })
+                    } else if st.configured
+                        && link_btn(ui, if self.show_cloud_sign_in { "Hide" } else { "Sign in" })
                             .clicked()
-                        {
-                            self.show_cloud_sign_in = !self.show_cloud_sign_in;
-                        }
+                    {
+                        self.show_cloud_sign_in = !self.show_cloud_sign_in;
                     }
                 });
             });
@@ -446,6 +498,18 @@ impl App {
                     }
                     if ghost_btn(ui, "Create").clicked() {
                         self.cloud_sign_up();
+                    }
+                    if ghost_btn(ui, "Reset").clicked() {
+                        match cloud::request_password_reset(&self.cloud_email) {
+                            Ok(()) => {
+                                self.cloud_note = "Password reset email sent. Confirm the account, then sign in.".into();
+                                self.cloud_note_ok = true;
+                            }
+                            Err(e) => {
+                                self.cloud_note = e;
+                                self.cloud_note_ok = false;
+                            }
+                        }
                     }
                 });
                 ui.label(
@@ -547,12 +611,70 @@ impl App {
                     .size(11.0)
                     .color(MUTED),
             );
-            if !self.cfg.auth_token.trim().is_empty() {
+            if !self.cfg.auth_enabled || self.cfg.auth_token.trim().is_empty() {
                 ui.label(
-                    RichText::new("Auth on — send X-MessengerBird-Token.")
+                    RichText::new("Open TX — anyone who can reach these ports can transmit.")
+                        .size(11.0)
+                        .color(RED),
+                );
+            } else if self.show_token || self.reveal_token {
+                ui.label(
+                    RichText::new("New token — copy it into VisionLab, then hide it.")
                         .size(11.0)
                         .color(AMBER),
                 );
+            }
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.cfg.auth_token)
+                        .hint_text("auth token")
+                        .desired_width(ui.available_width() - 8.0)
+                        .password(!self.reveal_token),
+                );
+            });
+            ui.horizontal(|ui| {
+                if link_btn(ui, if self.reveal_token { "Hide" } else { "Show" }).clicked() {
+                    self.reveal_token = !self.reveal_token;
+                    self.show_token = false;
+                }
+                if link_btn(ui, "Copy token").clicked() {
+                    ui.ctx().copy_text(self.cfg.auth_token.clone());
+                    self.copied_flash = Some(("Token copied".into(), std::time::Instant::now()));
+                }
+                if link_btn(ui, "Rotate").clicked() {
+                    self.cfg.auth_token = config::random_token();
+                    self.cfg.auth_enabled = true;
+                    self.reveal_token = true;
+                    self.persist();
+                    self.set_note("Token rotated", true);
+                }
+                if link_btn(ui, if self.cfg.auth_enabled { "Disable" } else { "Enable" }).clicked()
+                {
+                    self.cfg.auth_enabled = !self.cfg.auth_enabled;
+                    if self.cfg.auth_enabled && self.cfg.auth_token.is_empty() {
+                        self.cfg.auth_token = config::random_token();
+                        self.reveal_token = true;
+                    }
+                    self.persist();
+                }
+            });
+            ui.label(RichText::new("Allow CIDRs (comma, empty = any)").size(11.0).color(MUTED));
+            if ui
+                .add(
+                    egui::TextEdit::singleline(&mut self.allow_cidr_edit)
+                        .hint_text("10.0.0.0/8, 100.64.0.0/10")
+                        .desired_width(ui.available_width()),
+                )
+                .lost_focus()
+            {
+                self.cfg.allow_cidrs = self
+                    .allow_cidr_edit
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                self.persist();
             }
             if let Some((msg, _)) = &self.copied_flash {
                 ui.label(RichText::new(msg).size(11.0).color(GREEN));
@@ -579,7 +701,7 @@ impl App {
                 let mut muted = self.cfg.radio.muted;
                 if ui.checkbox(&mut muted, "Mute").changed() {
                     self.cfg.radio.muted = muted;
-                    radio::set_muted(muted);
+                    self.persist();
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ghost_btn(ui, "Read").clicked() {
@@ -601,6 +723,59 @@ impl App {
                         .color(if self.note_ok { GREEN } else { RED }),
                 );
             }
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Squelch").size(11.0).color(MUTED));
+                let mut sq = self.cfg.radio.squelch as f32;
+                if ui.add(egui::Slider::new(&mut sq, 0.0..=8.0).integer()).changed() {
+                    self.cfg.radio.squelch = sq as u8;
+                }
+                ui.label(RichText::new("CTCSS").size(11.0).color(MUTED));
+                egui::ComboBox::from_id_salt("ctcss")
+                    .selected_text(peltor::ctcss_label(self.cfg.radio.ctcss))
+                    .width(120.0)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.cfg.radio.ctcss, 0, "Off");
+                        for idx in 1u8..=38 {
+                            ui.selectable_value(
+                                &mut self.cfg.radio.ctcss,
+                                idx,
+                                peltor::ctcss_label(idx),
+                            );
+                        }
+                    });
+            });
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Audio").size(11.0).color(MUTED));
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.cfg.radio.audio_device)
+                        .desired_width(ui.available_width()),
+                );
+            });
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("CSMA wait s").size(11.0).color(MUTED));
+                let mut wait = self.cfg.radio.channel_wait_secs as f32;
+                if ui
+                    .add(egui::Slider::new(&mut wait, 1.0..=120.0).integer())
+                    .changed()
+                {
+                    self.cfg.radio.channel_wait_secs = wait as u64;
+                    radio::set_csma(
+                        self.cfg.radio.channel_wait_secs,
+                        self.cfg.radio.force_tx_if_busy,
+                    );
+                }
+                let mut force = self.cfg.radio.force_tx_if_busy;
+                if ui.checkbox(&mut force, "TX if still busy").changed() {
+                    self.cfg.radio.force_tx_if_busy = force;
+                    radio::set_csma(self.cfg.radio.channel_wait_secs, force);
+                }
+                let mut dry = self.cfg.radio.dry_run;
+                if ui.checkbox(&mut dry, "Dry run").changed() {
+                    self.cfg.radio.dry_run = dry;
+                    radio::set_dry_run(dry);
+                }
+            });
         });
     }
 
@@ -638,9 +813,9 @@ impl App {
                         if i > 0 {
                             ui.add_space(6.0);
                         }
-                        let status_color = if event.ok { GREEN } else { RED };
-                        let status = if event.ok { "Sent" } else { "Failed" };
                         ui.horizontal(|ui| {
+                            let status_color = if event.ok { GREEN } else { RED };
+                            let status = if event.ok { "Sent" } else { "Failed" };
                             mark(
                                 ui,
                                 RichText::new(&event.message)
@@ -666,6 +841,28 @@ impl App {
                                 },
                             );
                         });
+                        let meta = format!(
+                            "{} · {}{}",
+                            if event.source.is_empty() {
+                                "—"
+                            } else {
+                                event.source.as_str()
+                            },
+                            if event.sender_id.is_empty() {
+                                "—"
+                            } else {
+                                event.sender_id.as_str()
+                            },
+                            if event.client.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" · {}", event.client)
+                            }
+                        );
+                        ui.label(RichText::new(meta).size(10.0).color(MUTED));
+                        if !event.detail.is_empty() {
+                            ui.label(RichText::new(&event.detail).size(10.0).color(MUTED));
+                        }
                     }
                 });
         });
@@ -707,12 +904,125 @@ impl App {
                         let mut muted = sender_muted;
                         if ui.checkbox(&mut muted, "Mute").changed() {
                             self.cfg.senders[idx].muted = muted;
+                            self.persist();
+                        }
+                        if link_btn(ui, "Remove").clicked() {
+                            self.cfg.senders.remove(idx);
+                            self.persist();
+                            self.set_note("Sender removed — restart to free its port", true);
                         }
                     });
+                });
+                if self.cfg.senders.get(idx).is_none() {
+                    return;
+                }
+                let mut phrase = self.cfg.senders[idx].message.clone();
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Phrase").size(11.0).color(MUTED));
+                    if ui
+                        .add(
+                            egui::TextEdit::singleline(&mut phrase)
+                                .desired_width(ui.available_width()),
+                        )
+                        .lost_focus()
+                        && phrase.trim() != self.cfg.senders[idx].message
+                    {
+                        self.cfg.senders[idx].message = phrase.trim().to_string();
+                        self.cfg.senders[idx].name = self.cfg.senders[idx].message.clone();
+                        self.persist();
+                        self.set_note("Phrase saved — same port, no restart", true);
+                    }
                 });
             });
             ui.add_space(6.0);
         }
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.new_sender_name)
+                    .hint_text("New phrase")
+                    .desired_width(180.0),
+            );
+            if ghost_btn(ui, "Add sender").clicked() && !self.new_sender_name.trim().is_empty() {
+                let n = self.cfg.senders.len() as u16;
+                let phrase = self.new_sender_name.trim().to_string();
+                let id = phrase
+                    .to_ascii_lowercase()
+                    .chars()
+                    .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                    .collect::<String>();
+                self.cfg.senders.push(config::SenderCfg {
+                    id: if id.is_empty() {
+                        format!("sender_{}", n + 1)
+                    } else {
+                        id
+                    },
+                    name: phrase.clone(),
+                    listen: format!("0.0.0.0:{}", 8787 + n),
+                    message: phrase,
+                    muted: false,
+                });
+                self.new_sender_name.clear();
+                self.persist();
+                self.set_note("Sender added — restart MessengerBird to bind the new port", true);
+            }
+        });
+    }
+
+    fn auth_banner(&mut self, ui: &mut egui::Ui) {
+        if self.cfg.auth_enabled && !self.cfg.auth_token.is_empty() {
+            return;
+        }
+        card(ui, |ui| {
+            ui.label(
+                RichText::new("TX is unauthenticated on 0.0.0.0. Enable a token before leaving the lab.")
+                    .size(12.0)
+                    .color(RED),
+            );
+        });
+    }
+
+    fn about_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.show_about;
+        egui::Window::new("About MessengerBird")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
+                ui.label("VisionLab ↔ SA828 plant radio sender.");
+                ui.label("PTT is open-drain (LOW = TX, idle = High-Z).");
+                ui.label("Prefer Tailscale. Do not expose 8787–8789 on the public internet without the token.");
+                ui.label("HTTPS: put a reverse proxy in front; this app speaks plain HTTP.");
+                if ui.button("Hardware checklist").clicked() {
+                    self.show_wizard = true;
+                }
+            });
+        self.show_about = open;
+    }
+
+    fn wizard_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.show_wizard;
+        let mut done = false;
+        egui::Window::new("First-run checklist")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.label("1. UART: Pi 5 needs dtoverlay=uart0-pi5, then reboot.");
+                ui.label("2. Wiring: PTT BCM23, SPKEN BCM24, channel bits 5/6/12/13, audio to MIC.");
+                ui.label("3. Press Read, then Program, confirm channel 3.");
+                ui.label("4. TX each sender once and listen on the headset.");
+                ui.label("5. Copy the auth token into VisionLab.");
+                if ui.button("Done").clicked() {
+                    done = true;
+                }
+            });
+        if done {
+            self.cfg.wizard_done = true;
+            self.persist();
+            open = false;
+        }
+        self.show_wizard = open;
     }
 }
 

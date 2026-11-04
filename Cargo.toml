@@ -1,6 +1,6 @@
 [package]
 name = "messenger-bird"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Straight SA828 radio sender desktop app for Raspberry Pi"
 

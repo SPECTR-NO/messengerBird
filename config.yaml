@@ -12,10 +12,18 @@ radio:
   spken_gpio: 24
   audio_device: plughw:CARD=Headphones,DEV=0
   muted: false
+  channel_wait_secs: 30
+  force_tx_if_busy: true
+  dry_run: false
 
-# Optional. Empty = off (VisionLab works with no header).
-# When set, POST /tx needs X-MessengerBird-Token or Authorization: Bearer …
+# POST /tx requires X-MessengerBird-Token or Authorization: Bearer …
+# Empty token is filled on first launch when auth_enabled is true.
+auth_enabled: true
 auth_token: ""
+
+rate_per_minute: 30
+allow_cidrs: []
+wizard_done: false
 
 # Each sender is its own endpoint for a different machine / VisionLab sound.
 # Bind is always 0.0.0.0 so Tailscale / LAN / WAN reach the Pi.

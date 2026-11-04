@@ -14,6 +14,21 @@ chmod +x start.sh
 
 Listeners bind **`0.0.0.0:<port>`** so another PC on LAN, Tailscale, or a forwarded WAN path can reach the Pi.
 
+Prefer **Tailscale**. Do not publish 8787–8789 on the public internet without the auth token. This app speaks plain HTTP; terminate HTTPS on a reverse proxy if you need it.
+
+## Install (boot)
+
+```bash
+sudo ./install.sh
+systemctl start messengerbird
+```
+
+Installs to `/opt/messengerbird`, enables `messengerbird.service`, and writes a desktop entry that does not hardcode a home directory. `./start.sh` remains the dev build-and-run path.
+
+## RF / plant use
+
+MessengerBird keys an analog PMR446 SA828 on the channel selected in the app (default channel 3) using the same open-drain PTT sequence as SiloMonitor. Use it only on a channel and tone your plant is licensed or permitted to use. Keep the module idle (PTT High-Z) when not announcing.
+
 ## VisionLab remote test
 
 VisionLab host field = **this Pi’s address only (no port)**:
@@ -37,15 +52,11 @@ curl -s http://<host>:8787/health
 curl -s -X POST http://<host>:8787/tx
 ```
 
-### Auth (optional, off by default)
+### Auth (on by default)
 
-In `config.yaml`:
+The first launch writes a random `auth_token` into `config.yaml` when `auth_enabled: true`. Copy it into VisionLab.
 
-```yaml
-auth_token: ""   # empty = off; VisionLab needs no header
-```
-
-When set, `POST /tx` requires:
+`POST /tx` requires:
 
 ```http
 X-MessengerBird-Token: <token>
@@ -55,13 +66,26 @@ Authorization: Bearer <token>
 
 `GET /health` stays open so VisionLab can probe reachability without a token.
 
+Set `auth_enabled: false` only in a locked-down lab. The app shows a red warning while TX is open.
+
+Busy contract: a free radio returns **200** `{ ok, queued: false }`. If a clip is already playing, the next POST is **202** `{ queued: true }` (FIFO, depth 8). A full queue returns **503** with `Retry-After` — retry only then.
+
+### Smoke test
+
+```bash
+TOKEN=… ./scripts/smoke.sh
+```
+
+On the Pi, also: UI **Read**, confirm channel 3, **TX** each sender and hear it, toggle mute and restart (mute stays), PTT idle after each clip.
+
 ## MessengerBird cloud (Supabase)
 
 Separate from VisionLab’s database. Device identity, senders, and a Pi-side `tx_events` log.
 
 1. Apply SQL: `supabase/migrations/20261103180000_messengerbird_cloud.sql` in the project SQL editor.
 2. Copy `config/supabase.example.yaml` → `config/supabase.yaml` (gitignored) with URL + publishable key.
-3. In the app **Cloud** panel: create/sign in with email+password (authenticated RLS). Offline radio + HTTP keep working without sign-in.
+3. Apply `supabase/migrations/20261104120000_multi_device.sql` as well (device id + owner RLS).
+4. In the app **Cloud** panel: create/sign in with email+password. Confirm the email if asked, or use **Reset** to send a recovery link. Sign out revokes the refresh token. Offline radio + HTTP keep working without sign-in. Failed `tx_events` inserts retry from `config/tx_outbox.jsonl`.
 
 ## Audio
 

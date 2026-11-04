@@ -8,6 +8,8 @@ audio/preview/
 # MessengerBird Supabase secrets + session (never commit real keys)
 config/supabase.yaml
 config/supabase.session.yaml
+config/history.jsonl
+config/tx_outbox.jsonl
 .env
 .env.local
 

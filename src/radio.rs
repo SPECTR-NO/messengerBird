@@ -7,18 +7,18 @@
 //!   UART 9600 → /dev/ttyAMA0 (Pi 5: dtoverlay=uart0-pi5)
 //!   Audio: aplay → ALSA → pot → SA828 MIC+
 
+use serde::{Deserialize, Serialize};
 use rppal::gpio::{Gpio, OutputPin};
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_AUDIO: &str = "plughw:CARD=Headphones,DEV=0";
 const TX_MAX: Duration = Duration::from_secs(20);
-const CHANNEL_WAIT_MAX: Duration = Duration::from_secs(30);
 const CHANNEL_CLEAR_HOLD: Duration = Duration::from_millis(250);
 
 static TX_BUSY: AtomicBool = AtomicBool::new(false);
@@ -30,19 +30,37 @@ static CH_BIT2: AtomicU8 = AtomicU8::new(0);
 static CH_BIT4: AtomicU8 = AtomicU8::new(0);
 static CH_BIT8: AtomicU8 = AtomicU8::new(0);
 static MUTED: AtomicBool = AtomicBool::new(false);
+static DRY_RUN: AtomicBool = AtomicBool::new(false);
+static FORCE_TX_IF_BUSY: AtomicBool = AtomicBool::new(true);
+static CHANNEL_WAIT_SECS: AtomicU64 = AtomicU64::new(30);
 static AUDIO_DEVICE: Mutex<String> = Mutex::new(String::new());
 static STATUS: Mutex<Option<String>> = Mutex::new(None);
 static LAST_MESSAGE: Mutex<Option<String>> = Mutex::new(None);
 static HISTORY: Mutex<VecDeque<AlertEvent>> = Mutex::new(VecDeque::new());
-const HISTORY_MAX: usize = 80;
+const HISTORY_MAX: usize = 200;
+const QUEUE_MAX: usize = 8;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AlertEvent {
     /// Unix seconds (local display formatted in UI).
     pub at: u64,
     pub message: String,
     pub ok: bool,
     pub detail: String,
+    #[serde(default)]
+    pub sender_id: String,
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub client: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TxAccept {
+    /// Worker started this clip immediately.
+    Started,
+    /// Radio was busy; clip is waiting in the FIFO.
+    Queued,
 }
 
 fn now_unix() -> u64 {
@@ -53,17 +71,32 @@ fn now_unix() -> u64 {
 }
 
 pub fn push_alert(message: impl Into<String>, ok: bool, detail: impl Into<String>) {
+    push_alert_full(message, ok, detail, "", "", "");
+}
+
+pub fn push_alert_full(
+    message: impl Into<String>,
+    ok: bool,
+    detail: impl Into<String>,
+    sender_id: impl Into<String>,
+    source: impl Into<String>,
+    client: impl Into<String>,
+) {
     let event = AlertEvent {
         at: now_unix(),
         message: message.into(),
         ok,
         detail: detail.into(),
+        sender_id: sender_id.into(),
+        source: source.into(),
+        client: client.into(),
     };
     if let Ok(mut hist) = HISTORY.lock() {
         hist.push_front(event);
         while hist.len() > HISTORY_MAX {
             hist.pop_back();
         }
+        persist_history(&hist);
     }
 }
 
@@ -78,6 +111,58 @@ pub fn history() -> Vec<AlertEvent> {
 pub fn clear_history() {
     if let Ok(mut hist) = HISTORY.lock() {
         hist.clear();
+        persist_history(&hist);
+    }
+}
+
+fn history_path() -> PathBuf {
+    if let Ok(cwd) = std::env::current_dir() {
+        if cwd.join("config.yaml").exists() || cwd.join("Cargo.toml").exists() {
+            return cwd.join("config").join("history.jsonl");
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            return dir.join("config").join("history.jsonl");
+        }
+    }
+    PathBuf::from("config/history.jsonl")
+}
+
+fn persist_history(hist: &VecDeque<AlertEvent>) {
+    let path = history_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let mut text = String::new();
+    for event in hist.iter().rev().take(HISTORY_MAX) {
+        if let Ok(line) = serde_json::to_string(event) {
+            text.push_str(&line);
+            text.push('\n');
+        }
+    }
+    let _ = std::fs::write(path, text);
+}
+
+/// Load persisted alerts. Newest stays at the front.
+pub fn load_history() {
+    let path = history_path();
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return;
+    };
+    let mut loaded = VecDeque::new();
+    for line in text.lines() {
+        if let Ok(event) = serde_json::from_str::<AlertEvent>(line) {
+            loaded.push_back(event);
+        }
+    }
+    while loaded.len() > HISTORY_MAX {
+        loaded.pop_front();
+    }
+    // File is oldest-first; UI wants newest first.
+    let newest_first: VecDeque<AlertEvent> = loaded.into_iter().rev().collect();
+    if let Ok(mut hist) = HISTORY.lock() {
+        *hist = newest_first;
     }
 }
 
@@ -106,6 +191,15 @@ pub fn set_audio_device(dev: &str) {
     if let Ok(mut g) = AUDIO_DEVICE.lock() {
         *g = dev.trim().to_string();
     }
+}
+
+pub fn set_dry_run(on: bool) {
+    DRY_RUN.store(on, Ordering::SeqCst);
+}
+
+pub fn set_csma(wait_secs: u64, force_tx_if_busy: bool) {
+    CHANNEL_WAIT_SECS.store(wait_secs.max(1), Ordering::SeqCst);
+    FORCE_TX_IF_BUSY.store(force_tx_if_busy, Ordering::SeqCst);
 }
 
 pub fn set_muted(muted: bool) {
@@ -141,6 +235,9 @@ fn set_status(msg: String) {
 /// Drive SA828 pins 4/5/7/6 so the module transmits on `ch`.
 /// NiceRF encode is active-low (same as SiloMonitor).
 pub fn select_channel(ch: u8) -> Result<(), String> {
+    if DRY_RUN.load(Ordering::SeqCst) {
+        return Ok(());
+    }
     let code = crate::peltor::sa828_channel_code(ch);
     let pins = [
         CH_BIT1.load(Ordering::SeqCst),
@@ -148,7 +245,7 @@ pub fn select_channel(ch: u8) -> Result<(), String> {
         CH_BIT4.load(Ordering::SeqCst),
         CH_BIT8.load(Ordering::SeqCst),
     ];
-    if pins.iter().any(|p| *p == 0) {
+    if pins.contains(&0) {
         return Err(
             "Channel pins not wired. SA828 4/5/7/6 → Pi GPIO 5/6/12/13.".into(),
         );
@@ -280,64 +377,14 @@ impl Drop for Ptt {
     }
 }
 
+/// Configured ALSA device only — no card auto-fallback (same as SiloMonitor).
 fn audio_device() -> String {
-    let configured = AUDIO_DEVICE
+    AUDIO_DEVICE
         .lock()
         .ok()
         .map(|g| g.clone())
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| DEFAULT_AUDIO.to_string());
-    resolve_playback_device(&configured)
-}
-
-fn card_id(device: &str) -> Option<&str> {
-    let rest = device.split("CARD=").nth(1)?;
-    let id = rest.split([',', ':']).next()?.trim();
-    if id.is_empty() {
-        None
-    } else {
-        Some(id)
-    }
-}
-
-fn alsa_cards() -> Vec<(String, bool)> {
-    let text = std::fs::read_to_string("/proc/asound/cards").unwrap_or_default();
-    let mut out = Vec::new();
-    for line in text.lines() {
-        let Some(start) = line.find('[') else { continue };
-        let Some(end) = line[start + 1..].find(']') else {
-            continue;
-        };
-        let id = line[start + 1..start + 1 + end].trim();
-        if id.is_empty() {
-            continue;
-        }
-        let usb = line.to_ascii_lowercase().contains("usb");
-        out.push((id.to_string(), usb));
-    }
-    out
-}
-
-fn plughw(card: &str) -> String {
-    format!("plughw:CARD={card},DEV=0")
-}
-
-fn resolve_playback_device(configured: &str) -> String {
-    let cards = alsa_cards();
-    if cards.is_empty() {
-        return configured.to_string();
-    }
-    if let Some(id) = card_id(configured) {
-        if cards.iter().any(|(name, _)| name == id) {
-            return configured.to_string();
-        }
-    }
-    cards
-        .iter()
-        .find(|(_, usb)| *usb)
-        .or_else(|| cards.first())
-        .map(|(name, _)| plughw(name))
-        .unwrap_or_else(|| configured.to_string())
+        .unwrap_or_else(|| DEFAULT_AUDIO.to_string())
 }
 
 fn root_dirs() -> Vec<PathBuf> {
@@ -400,12 +447,26 @@ pub struct TxMeta {
     pub client_host: Option<String>,
 }
 
-/// Fire TX on a worker thread. Returns Ok when playback starts (or Err if rejected).
-pub fn transmit_message(message: &str) -> Result<(), String> {
+/// Fire TX. `Started` = on air now; `Queued` = waiting behind the current clip.
+#[allow(dead_code)]
+pub fn transmit_message(message: &str) -> Result<TxAccept, String> {
     transmit_with(message, TxMeta::default())
 }
 
-pub fn transmit_with(message: &str, meta: TxMeta) -> Result<(), String> {
+struct TxJob {
+    wav: PathBuf,
+    label: String,
+    meta: TxMeta,
+}
+
+static TX_QUEUE: Mutex<VecDeque<TxJob>> = Mutex::new(VecDeque::new());
+static WORKER: AtomicBool = AtomicBool::new(false);
+
+pub fn queue_len() -> usize {
+    TX_QUEUE.lock().map(|q| q.len()).unwrap_or(0)
+}
+
+pub fn transmit_with(message: &str, meta: TxMeta) -> Result<TxAccept, String> {
     let label = message.trim().to_string();
     let source = if meta.source.is_empty() {
         "ui"
@@ -427,7 +488,7 @@ pub fn transmit_with(message: &str, meta: TxMeta) -> Result<(), String> {
     }
     if MUTED.load(Ordering::SeqCst) {
         let err = "Muted".to_string();
-        push_alert(&label, false, &err);
+        push_alert_full(&label, false, &err, &meta.sender_id, source, meta.client_host.as_deref().unwrap_or(""));
         crate::cloud::log_tx_simple(
             &meta.sender_id,
             &label,
@@ -445,7 +506,14 @@ pub fn transmit_with(message: &str, meta: TxMeta) -> Result<(), String> {
                 "No WAV for “{label}”. Put {}.wav or alert.wav in audio/",
                 phrase_slug(&label)
             );
-            push_alert(&label, false, &err);
+            push_alert_full(
+                &label,
+                false,
+                &err,
+                &meta.sender_id,
+                source,
+                meta.client_host.as_deref().unwrap_or(""),
+            );
             crate::cloud::log_tx_simple(
                 &meta.sender_id,
                 &label,
@@ -457,48 +525,104 @@ pub fn transmit_with(message: &str, meta: TxMeta) -> Result<(), String> {
             return Err(err);
         }
     };
-    if TX_BUSY
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err()
-    {
-        let err = "Already transmitting".to_string();
-        push_alert(&label, false, &err);
-        crate::cloud::log_tx_simple(
-            &meta.sender_id,
-            &label,
-            false,
-            source,
-            meta.client_host.clone(),
-            Some(err.clone()),
-        );
-        return Err(err);
+    let job = TxJob {
+        wav,
+        label: label.clone(),
+        meta,
+    };
+    let mut q = TX_QUEUE.lock().map_err(|_| "tx queue busy".to_string())?;
+    if WORKER.load(Ordering::SeqCst) {
+        if q.len() >= QUEUE_MAX {
+            let err = "Transmit queue full".to_string();
+            push_alert_full(
+                &label,
+                false,
+                &err,
+                &job.meta.sender_id,
+                source,
+                job.meta.client_host.as_deref().unwrap_or(""),
+            );
+            crate::cloud::log_tx_simple(
+                &job.meta.sender_id,
+                &label,
+                false,
+                source,
+                job.meta.client_host.clone(),
+                Some(err.clone()),
+            );
+            return Err(err);
+        }
+        q.push_back(job);
+        return Ok(TxAccept::Queued);
     }
+    WORKER.store(true, Ordering::SeqCst);
+    TX_BUSY.store(true, Ordering::SeqCst);
+    drop(q);
     if let Ok(mut g) = LAST_MESSAGE.lock() {
-        *g = Some(label.clone());
+        *g = Some(label);
     }
-    let sender_id = meta.sender_id;
-    let client_host = meta.client_host;
-    thread::spawn(move || {
-        let (ok, msg) = match play_voice_keyed(&wav) {
-            Ok(()) => (true, format!("Played {label}")),
+    thread::spawn(move || worker_loop(job));
+    Ok(TxAccept::Started)
+}
+
+fn worker_loop(first: TxJob) {
+    let mut current = Some(first);
+    loop {
+        let job = if let Some(job) = current.take() {
+            job
+        } else {
+            let mut q = match TX_QUEUE.lock() {
+                Ok(q) => q,
+                Err(_) => {
+                    WORKER.store(false, Ordering::SeqCst);
+                    TX_BUSY.store(false, Ordering::SeqCst);
+                    return;
+                }
+            };
+            match q.pop_front() {
+                Some(job) => job,
+                None => {
+                    WORKER.store(false, Ordering::SeqCst);
+                    TX_BUSY.store(false, Ordering::SeqCst);
+                    return;
+                }
+            }
+        };
+        TX_BUSY.store(true, Ordering::SeqCst);
+        if let Ok(mut g) = LAST_MESSAGE.lock() {
+            *g = Some(job.label.clone());
+        }
+        let source = if job.meta.source.is_empty() {
+            "ui"
+        } else {
+            job.meta.source
+        };
+        let client = job.meta.client_host.clone().unwrap_or_default();
+        let (ok, msg) = match play_voice_path(&job.wav) {
+            Ok(()) => (true, format!("Played {}", job.label)),
             Err(e) => {
                 eprintln!("radio: {e}");
                 (false, e)
             }
         };
-        push_alert(&label, ok, &msg);
+        push_alert_full(&job.label, ok, &msg, &job.meta.sender_id, source, &client);
         crate::cloud::log_tx_simple(
-            &sender_id,
-            &label,
+            &job.meta.sender_id,
+            &job.label,
             ok,
             source,
-            client_host,
+            job.meta.client_host.clone(),
             Some(msg.clone()),
         );
         set_status(msg);
-        TX_BUSY.store(false, Ordering::SeqCst);
-    });
-    Ok(())
+    }
+}
+
+/// SiloMonitor `play_voice_path`: keyed playback, then force High-Z idle.
+fn play_voice_path(wav: &PathBuf) -> Result<(), String> {
+    let result = play_voice_keyed(wav);
+    ensure_ptt_idle();
+    result
 }
 
 fn wav_pcm_duration(path: &PathBuf) -> Result<Duration, String> {
@@ -548,7 +672,7 @@ fn wav_pcm_duration(path: &PathBuf) -> Result<Duration, String> {
     }
 
     let data_bytes = data_bytes.ok_or_else(|| "wav missing data chunk".to_string())?;
-    if sample_rate == 0 || channels == 0 || bits == 0 || bits % 8 != 0 {
+    if sample_rate == 0 || channels == 0 || bits == 0 || !bits.is_multiple_of(8) {
         return Err("wav invalid format".into());
     }
     let bytes_per_frame = u64::from(channels) * u64::from(bits / 8);
@@ -564,9 +688,16 @@ fn wav_pcm_duration(path: &PathBuf) -> Result<Duration, String> {
 }
 
 fn play_voice_keyed(wav: &PathBuf) -> Result<(), String> {
+    if DRY_RUN.load(Ordering::SeqCst) {
+        eprintln!("radio: dry-run (no GPIO / aplay) {}", wav.display());
+        thread::sleep(Duration::from_millis(200));
+        return Ok(());
+    }
+
     wait_channel_clear()?;
 
     let duration = wav_pcm_duration(wav)?;
+    // Unkey 0.5 s before the last sample so TX dies before the clip ends.
     let release_after = duration.saturating_sub(Duration::from_millis(500));
 
     let tx = Ptt::key()?;
@@ -589,7 +720,6 @@ fn play_voice_keyed(wav: &PathBuf) -> Result<(), String> {
         match child.try_wait() {
             Ok(Some(status)) => {
                 drop(ptt.take());
-                ensure_ptt_idle();
                 return if status.success() {
                     Ok(())
                 } else {
@@ -603,14 +733,12 @@ fn play_voice_keyed(wav: &PathBuf) -> Result<(), String> {
                 if Instant::now() >= deadline {
                     let _ = child.kill();
                     drop(ptt.take());
-                    ensure_ptt_idle();
                     return Err("aplay timed out".into());
                 }
                 thread::sleep(Duration::from_millis(1));
             }
             Err(e) => {
                 drop(ptt.take());
-                ensure_ptt_idle();
                 return Err(format!("aplay wait: {e}"));
             }
         }
@@ -634,6 +762,7 @@ fn wait_channel_clear() -> Result<(), String> {
     if pin == 0 {
         return Ok(());
     }
+    let wait_max = Duration::from_secs(CHANNEL_WAIT_SECS.load(Ordering::SeqCst).max(1));
     let start = Instant::now();
     let mut clear_since: Option<Instant> = None;
     loop {
@@ -653,12 +782,18 @@ fn wait_channel_clear() -> Result<(), String> {
                 Some(_) => {}
             }
         }
-        if start.elapsed() >= CHANNEL_WAIT_MAX {
-            eprintln!(
-                "radio: channel busy >{}s — transmitting anyway",
-                CHANNEL_WAIT_MAX.as_secs()
-            );
-            return Ok(());
+        if start.elapsed() >= wait_max {
+            if FORCE_TX_IF_BUSY.load(Ordering::SeqCst) {
+                eprintln!(
+                    "radio: channel busy >{}s — transmitting anyway",
+                    wait_max.as_secs()
+                );
+                return Ok(());
+            }
+            return Err(format!(
+                "Channel busy >{}s — not transmitting",
+                wait_max.as_secs()
+            ));
         }
         thread::sleep(Duration::from_millis(50));
     }
